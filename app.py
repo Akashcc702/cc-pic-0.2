@@ -165,22 +165,25 @@ def webhook():
                 "🤖 <b>CC Pic Bot v5 — AI Image Generator</b>\n\n"
                 "⚡ Powered by Pollinations.ai\n"
                 "✅ 100% Free • No limits • No credits!\n\n"
+                "💬 <b>Just type your prompt directly!</b>\n"
+                "<i>Example: beautiful girl, cinematic lighting</i>\n\n"
                 "📌 <b>Commands:</b>\n"
-                "/generate &lt;prompt&gt; — Image generate\n"
                 "/model — Model ಆಯ್ಕೆ\n"
                 "/size — Image size ಆಯ್ಕೆ\n"
                 "/models — ಎಲ್ಲಾ models\n"
                 "/help — Help\n\n"
                 "🎨 <b>Example:</b>\n"
-                "/generate a sunset over mountains, cinematic, 4K"
+                "a sunset over mountains, cinematic, 4K"
             )
 
         elif text.startswith('/help'):
             send_message(chat_id,
                 "📖 <b>CC Pic Bot Help:</b>\n\n"
+                "💬 <b>Direct typing works!</b>\n"
+                "Just type your prompt — no command needed!\n\n"
                 "1️⃣ /model → Model ಆಯ್ಕೆ\n"
                 "2️⃣ /size → Size ಆಯ್ಕೆ\n"
-                "3️⃣ /generate your prompt → Image!\n\n"
+                "3️⃣ Type your prompt → Image!\n\n"
                 "💡 <b>Prompt Tips:</b>\n"
                 "• <i>\"a mountain lake at sunrise, 4K, cinematic\"</i>\n"
                 "• Style: <i>anime, oil painting, photorealistic</i>\n"
@@ -232,7 +235,36 @@ def webhook():
                 send_message(chat_id, error or "❌ Image generate ಆಗಲಿಲ್ಲ.")
 
         else:
-            send_message(chat_id, "👋 /generate &lt;prompt&gt; ಉಪಯೋಗಿಸಿ!\n/help ನೋಡಿ.")
+            # Plain text = treat as image prompt directly (no /generate needed)
+            prompt = text.strip()
+            if not prompt:
+                return jsonify({'status': 'ok'})
+
+            model_key = user_model_choice.get(chat_id, "1")
+            size_key = user_size_choice.get(chat_id, "1")
+            model = MODELS[model_key]
+            size = SIZES[size_key]
+
+            send_message(chat_id,
+                f"🎨 <b>{model['name']}</b> | 📐 {size['name']}\n"
+                f"📝 <i>{prompt[:100]}</i>\n\n"
+                f"⏳ Generate ಆಗ್ತಿದೆ..."
+            )
+
+            image_data, error = generate_image(prompt, model["id"], size["w"], size["h"])
+
+            if image_data:
+                files = {'photo': ('image.jpg', image_data, 'image/jpeg')}
+                result = telegram_api("sendPhoto", {
+                    "chat_id": chat_id,
+                    "caption": f"✅ <b>{model['name']}</b> | {size['name']}\n📝 {prompt[:200]}",
+                    "parse_mode": "HTML"
+                }, files=files)
+                if not result or not result.get('ok'):
+                    files2 = {'document': ('image.jpg', image_data, 'image/jpeg')}
+                    telegram_api("sendDocument", {"chat_id": chat_id}, files=files2)
+            else:
+                send_message(chat_id, error or "❌ Image generate ಆಗಲಿಲ್ಲ.")
 
         return jsonify({'status': 'ok'})
 
