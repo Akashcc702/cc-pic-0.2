@@ -6,12 +6,13 @@ import urllib.parse
 import time
 import random
 import re
+import threading
 from datetime import datetime
 
 app = Flask(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-ADMIN_CHAT_ID      = os.environ.get('ADMIN_CHAT_ID')
+ADMIN_CHAT_ID      = os.environ.get('ADMIN_CHAT_ID', '')
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,6 +22,8 @@ POLLINATIONS_URL = (
     "?model={model}&width={width}&height={height}"
     "&seed={seed}&nologo=true&enhance={enhance}"
 )
+
+COOLDOWN_SECONDS = 120  # 2 minutes
 
 # =========================================================
 # STATIC DATA
@@ -103,6 +106,7 @@ user_enhance      = {}
 user_style        = {}
 user_last_prompt  = {}
 user_all_ids      = set()
+user_cooldown     = {}   # chat_id -> end_timestamp (float)
 
 # =========================================================
 # STATS
@@ -114,24 +118,39 @@ stats = {
 }
 
 # =========================================================
-# MAIN MENU keyboard — always visible at bottom
-# =========================================================
-MAIN_MENU = {
-    "keyboard": [
-        ["🎲 Random",      "🏆 Daily Challenge"],
-        ["🎨 Style",       "📱 Ratio"],
-        ["🤖 Model",       "📐 Size"],
-        ["✨ Enhance",     "📊 Stats"],
-        ["❓ Help"],
-    ],
-    "resize_keyboard":   True,
-    "one_time_keyboard": False,
-    "input_field_placeholder": "Type your prompt here...",
-}
-
-# =========================================================
 # HELPERS
 # =========================================================
+def is_admin(chat_id):
+    return ADMIN_CHAT_ID and str(chat_id) == str(ADMIN_CHAT_ID)
+
+
+def get_menu(chat_id):
+    """Return menu keyboard — admin sees Stats button, others don't."""
+    if is_admin(chat_id):
+        return {
+            "keyboard": [
+                ["🎲 Random",  "🏆 Daily Challenge"],
+                ["🎨 Style",   "📱 Ratio"],
+                ["✨ Enhance", "📊 Stats"],
+                ["❓ Help"],
+            ],
+            "resize_keyboard":   True,
+            "one_time_keyboard": False,
+            "input_field_placeholder": "Type your prompt here...",
+        }
+    else:
+        return {
+            "keyboard": [
+                ["🎲 Random",  "🏆 Daily Challenge"],
+                ["🎨 Style",   "📱 Ratio"],
+                ["✨ Enhance", "❓ Help"],
+            ],
+            "resize_keyboard":   True,
+            "one_time_keyboard": False,
+            "input_field_placeholder": "Type your prompt here...",
+        }
+
+
 def telegram_api(method, data=None, files=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
     try:
@@ -147,17 +166,81 @@ def telegram_api(method, data=None, files=None):
         return None
 
 
-def send_message(chat_id, text, reply_markup=None, inline_markup=None):
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-    if inline_markup:
-        payload["reply_markup"] = inline_markup
-    elif reply_markup:
-        payload["reply_markup"] = reply_markup
-    else:
-        payload["reply_markup"] = MAIN_MENU   # always show main menu
+def send_message(chat_id, text, inline_markup=None):
+    payload = {
+        "chat_id":      chat_id,
+        "text":         text,
+        "parse_mode":   "HTML",
+        "reply_markup": inline_markup if inline_markup else get_menu(chat_id),
+    }
     return telegram_api("sendMessage", payload)
 
 
+def edit_message(chat_id, message_id, text):
+    return telegram_api("editMessageText", {
+        "chat_id":    chat_id,
+        "message_id": message_id,
+        "text":       text,
+        "parse_mode": "HTML",
+    })
+
+
+# =========================================================
+# COOLDOWN TIMER (background thread)
+# =========================================================
+def run_cooldown_timer(chat_id, message_id, end_time):
+    """Edit cooldown message every 10s until timer ends."""
+    while True:
+        remaining = end_time - time.time()
+        if remaining <= 0:
+            edit_message(chat_id, message_id,
+                "✅ <b>Ready!</b> Type your next prompt 🎨")
+            user_cooldown.pop(chat_id, None)
+            break
+        mins = int(remaining // 60)
+        secs = int(remaining % 60)
+        edit_message(chat_id, message_id,
+            f"⏳ <b>Cooldown:</b> {mins}:{secs:02d} remaining\n"
+            f"<i>Please wait before generating next image...</i>"
+        )
+        time.sleep(10)
+
+
+def start_cooldown(chat_id):
+    """Send cooldown message and launch background timer thread."""
+    end_time = time.time() + COOLDOWN_SECONDS
+    user_cooldown[chat_id] = end_time
+    result = send_message(chat_id,
+        f"⏳ <b>Cooldown:</b> 2:00 remaining\n"
+        f"<i>Please wait before generating next image...</i>"
+    )
+    if result and result.get("ok"):
+        msg_id = result["result"]["message_id"]
+        t = threading.Thread(
+            target=run_cooldown_timer,
+            args=(chat_id, msg_id, end_time),
+            daemon=True
+        )
+        t.start()
+
+
+def check_cooldown(chat_id):
+    """Returns (on_cooldown: bool, remaining_str: str)."""
+    end = user_cooldown.get(chat_id)
+    if not end:
+        return False, ""
+    remaining = end - time.time()
+    if remaining <= 0:
+        user_cooldown.pop(chat_id, None)
+        return False, ""
+    mins = int(remaining // 60)
+    secs = int(remaining % 60)
+    return True, f"{mins}:{secs:02d}"
+
+
+# =========================================================
+# IMAGE GENERATION
+# =========================================================
 def generate_image(prompt, model_id, width=1024, height=1024, enhance=True):
     seed    = random.randint(1, 999999)
     encoded = urllib.parse.quote(prompt)
@@ -210,6 +293,16 @@ def styled_prompt(prompt, chat_id):
 
 
 def do_generate(chat_id, prompt, upscale=False):
+    # Check cooldown (admin bypasses cooldown)
+    if not is_admin(chat_id):
+        on_cd, remaining = check_cooldown(chat_id)
+        if on_cd:
+            send_message(chat_id,
+                f"⏳ <b>Cooldown active!</b> {remaining} remaining\n"
+                f"<i>Please wait before generating next image.</i>"
+            )
+            return
+
     model_key       = user_model_choice.get(chat_id, "1")
     model           = MODELS[model_key]
     enhance         = user_enhance.get(chat_id, True)
@@ -221,8 +314,8 @@ def do_generate(chat_id, prompt, upscale=False):
 
     full_prompt = styled_prompt(prompt, chat_id)
 
-    # ── Simplified status: just 🎨CC_PIC ──
-    send_message(chat_id,
+    # Status message
+    status_result = send_message(chat_id,
         f"🎨CC_PIC\n"
         f"📝 <i>{prompt[:100]}</i>\n"
         f"⏳ Generate ಆಗ್ತಿದೆ..."
@@ -230,18 +323,28 @@ def do_generate(chat_id, prompt, upscale=False):
 
     image_data, error = generate_image(full_prompt, model["id"], w, h, enhance)
 
+    # Delete the "generating..." status message
+    if status_result and status_result.get("ok"):
+        telegram_api("deleteMessage", {
+            "chat_id":    chat_id,
+            "message_id": status_result["result"]["message_id"],
+        })
+
     if image_data:
         stats["total"] += 1
         stats["model_usage"][model_key] = stats["model_usage"].get(model_key, 0) + 1
         user_last_prompt[chat_id] = prompt
 
-        # Inline buttons under the image
+        # Inline buttons under image
         inline_buttons = {
             "inline_keyboard": [[
                 {"text": "🔄 Variation",   "callback_data": f"vary_{chat_id}"},
                 {"text": "🔍 Upscale 2x", "callback_data": f"upscale_{chat_id}"},
             ]]
         }
+
+        # Send image as photo with reply keyboard + inline buttons
+        # Use reply_markup for inline (caption buttons) - Telegram supports inline on photos
         files  = {"photo": ("image.jpg", image_data, "image/jpeg")}
         result = telegram_api("sendPhoto", {
             "chat_id":      chat_id,
@@ -249,15 +352,27 @@ def do_generate(chat_id, prompt, upscale=False):
             "parse_mode":   "HTML",
             "reply_markup": inline_buttons,
         }, files=files)
+
+        # Fallback to document if photo fails
         if not result or not result.get("ok"):
             files2 = {"document": ("image.jpg", image_data, "image/jpeg")}
-            telegram_api("sendDocument", {"chat_id": chat_id}, files=files2)
+            telegram_api("sendDocument", {
+                "chat_id":      chat_id,
+                "caption":      f"🎨CC_PIC\n📝 {prompt[:200]}",
+                "parse_mode":   "HTML",
+                "reply_markup": inline_buttons,
+            }, files=files2)
+
+        # Start cooldown AFTER successful generation (non-admin only)
+        if not is_admin(chat_id):
+            start_cooldown(chat_id)
+
     else:
         send_message(chat_id, error or "❌ Image generate ಆಗಲಿಲ್ಲ.")
 
 
 # =========================================================
-# INLINE KEYBOARD BUILDERS  (for settings menus)
+# INLINE KEYBOARD BUILDERS
 # =========================================================
 def models_keyboard():
     return {"inline_keyboard": [
@@ -338,6 +453,10 @@ def webhook():
                     send_message(chat_id, f"✅ Style: <b>{st['name']}</b>{preview}\n💡 ಈಗ prompt type ಮಾಡಿ!")
 
             elif cb_data.startswith("vary_"):
+                on_cd, remaining = check_cooldown(chat_id)
+                if not is_admin(chat_id) and on_cd:
+                    telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": f"⏳ Cooldown: {remaining} remaining!", "show_alert": True})
+                    return jsonify({"status": "ok"})
                 orig_id = int(cb_data[5:])
                 telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "🔄 Variation generate ಆಗ್ತಿದೆ..."})
                 last = user_last_prompt.get(orig_id)
@@ -347,6 +466,10 @@ def webhook():
                     send_message(chat_id, "⚠️ ಹಿಂದಿನ prompt ಸಿಗಲಿಲ್ಲ. ಮತ್ತೆ type ಮಾಡಿ.")
 
             elif cb_data.startswith("upscale_"):
+                on_cd, remaining = check_cooldown(chat_id)
+                if not is_admin(chat_id) and on_cd:
+                    telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": f"⏳ Cooldown: {remaining} remaining!", "show_alert": True})
+                    return jsonify({"status": "ok"})
                 orig_id = int(cb_data[8:])
                 telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "🔍 Upscaling 2x..."})
                 last = user_last_prompt.get(orig_id)
@@ -367,7 +490,6 @@ def webhook():
 
         user_all_ids.add(chat_id)
 
-        # ── /start ───────────────────────────────────────────────────────
         if text.startswith("/start"):
             send_message(chat_id,
                 "🎨 <b>CC_PIC — AI Image Generator</b>\n\n"
@@ -378,55 +500,24 @@ def webhook():
                 "👇 ಕೆಳಗಿನ buttons ಉಪಯೋಗಿಸಿ settings change ಮಾಡಿ."
             )
 
-        # ── /help ────────────────────────────────────────────────────────
         elif text in ["❓ Help", "/help"]:
             send_message(chat_id,
                 "📖 <b>CC_PIC Help</b>\n\n"
                 "💬 <b>Image Generate:</b>\n"
                 "Just type your prompt directly!\n"
                 "<code>3x: sunset mountains</code> → 3 images\n\n"
-                "🎛️ <b>Settings Buttons:</b>\n"
-                "🤖 Model — AI model ಆಯ್ಕೆ\n"
-                "📐 Size — Image dimensions\n"
+                "🎛️ <b>Menu Buttons:</b>\n"
+                "🎨 Style — Art style preset\n"
                 "📱 Ratio — Platform sizes\n"
-                "🎨 Style — Art style\n"
-                "✨ Enhance — Prompt boost toggle\n\n"
-                "🎯 <b>Quick Actions:</b>\n"
+                "✨ Enhance — Prompt boost toggle\n"
                 "🎲 Random — Surprise image\n"
-                "🏆 Daily Challenge — Today's theme\n"
-                "📊 Stats — Usage stats\n\n"
+                "🏆 Daily Challenge — Today's theme\n\n"
                 "🔄 <b>After every image:</b>\n"
                 "Variation + Upscale 2x buttons ಇವೆ!\n\n"
+                "⏳ <b>Cooldown:</b> 2 min per image\n"
                 "⚡ Defaults: FLUX • 1024×1024 • Enhance ON"
             )
 
-        # ── 🤖 Model ─────────────────────────────────────────────────────
-        elif text in ["🤖 Model", "/model"]:
-            cur_key  = user_model_choice.get(chat_id, "1")
-            cur_name = MODELS[cur_key]["name"]
-            send_message(chat_id,
-                f"🤖 <b>Model ಆಯ್ಕೆ ಮಾಡಿ:</b>\nCurrent: <b>{cur_name}</b>",
-                inline_markup=models_keyboard()
-            )
-
-        # ── 📐 Size ──────────────────────────────────────────────────────
-        elif text in ["📐 Size", "/size"]:
-            sn, sw, sh = get_size(chat_id)
-            send_message(chat_id,
-                f"📐 <b>Image Size ಆಯ್ಕೆ ಮಾಡಿ:</b>\nCurrent: <b>{sn}</b> ({sw}×{sh})",
-                inline_markup=sizes_keyboard()
-            )
-
-        # ── 📱 Ratio ─────────────────────────────────────────────────────
-        elif text in ["📱 Ratio", "/ratio"]:
-            cur     = user_ratio.get(chat_id)
-            cur_txt = f"\nCurrent: <b>{cur['name']}</b>" if cur else ""
-            send_message(chat_id,
-                f"📱 <b>Platform Ratio ಆಯ್ಕೆ ಮಾಡಿ:</b>{cur_txt}",
-                inline_markup=ratios_keyboard()
-            )
-
-        # ── 🎨 Style ─────────────────────────────────────────────────────
         elif text in ["🎨 Style", "/style"]:
             cur_key  = user_style.get(chat_id, "7")
             cur_name = STYLE_PRESETS[cur_key]["name"]
@@ -435,7 +526,14 @@ def webhook():
                 inline_markup=styles_keyboard()
             )
 
-        # ── ✨ Enhance ────────────────────────────────────────────────────
+        elif text in ["📱 Ratio", "/ratio"]:
+            cur     = user_ratio.get(chat_id)
+            cur_txt = f"\nCurrent: <b>{cur['name']}</b>" if cur else ""
+            send_message(chat_id,
+                f"📱 <b>Platform Ratio ಆಯ್ಕೆ ಮಾಡಿ:</b>{cur_txt}",
+                inline_markup=ratios_keyboard()
+            )
+
         elif text in ["✨ Enhance", "/enhance"]:
             cur     = user_enhance.get(chat_id, True)
             new_val = not cur
@@ -448,27 +546,28 @@ def webhook():
                    "Prompt ಯಥಾವತ್ ಉಪಯೋಗಿಸಲಾಗುತ್ತದೆ.")
             )
 
-        # ── 📊 Stats ─────────────────────────────────────────────────────
         elif text in ["📊 Stats", "/stats"]:
-            breakdown = "\n".join(
-                f"  {MODELS[k]['name']}: <b>{v}</b> images"
-                for k, v in stats["model_usage"].items()
-            )
-            send_message(chat_id,
-                f"📊 <b>CC_PIC Stats:</b>\n\n"
-                f"🖼️ Total Images: <b>{stats['total']}</b>\n"
-                f"👥 Total Users: <b>{len(user_all_ids)}</b>\n"
-                f"🕐 Since: <b>{stats['since']}</b>\n\n"
-                f"🎨 <b>Model Breakdown:</b>\n{breakdown}"
-            )
+            # Admin only
+            if not is_admin(chat_id):
+                send_message(chat_id, "❌ Admin only command.")
+            else:
+                breakdown = "\n".join(
+                    f"  {MODELS[k]['name']}: <b>{v}</b> images"
+                    for k, v in stats["model_usage"].items()
+                )
+                send_message(chat_id,
+                    f"📊 <b>CC_PIC Stats:</b>\n\n"
+                    f"🖼️ Total Images: <b>{stats['total']}</b>\n"
+                    f"👥 Total Users: <b>{len(user_all_ids)}</b>\n"
+                    f"🕐 Since: <b>{stats['since']}</b>\n\n"
+                    f"🎨 <b>Model Breakdown:</b>\n{breakdown}"
+                )
 
-        # ── 🎲 Random ────────────────────────────────────────────────────
         elif text in ["🎲 Random", "/random"]:
             rp = random.choice(RANDOM_PROMPTS)
             send_message(chat_id, f"🎲 <b>Random Prompt:</b>\n<i>{rp}</i>")
             do_generate(chat_id, rp)
 
-        # ── 🏆 Daily Challenge ───────────────────────────────────────────
         elif text in ["🏆 Daily Challenge", "/daily"]:
             day   = datetime.now().timetuple().tm_yday
             theme = DAILY_THEMES[day % len(DAILY_THEMES)]
@@ -479,7 +578,6 @@ def webhook():
                 f"<i>Example: ancient Indian warrior in space, nebula, epic, 8K</i>"
             )
 
-        # ── /upscale ─────────────────────────────────────────────────────
         elif text.startswith("/upscale"):
             last = user_last_prompt.get(chat_id)
             if last:
@@ -487,9 +585,8 @@ def webhook():
             else:
                 send_message(chat_id, "⚠️ ಮೊದಲು ಒಂದು image generate ಮಾಡಿ.")
 
-        # ── /broadcast (admin) ───────────────────────────────────────────
         elif text.startswith("/broadcast"):
-            if ADMIN_CHAT_ID and str(chat_id) == str(ADMIN_CHAT_ID):
+            if is_admin(chat_id):
                 msg = text[len("/broadcast"):].strip()
                 if msg:
                     success = 0
@@ -503,7 +600,6 @@ def webhook():
             else:
                 send_message(chat_id, "❌ Admin only.")
 
-        # ── /generate (backward compat) ──────────────────────────────────
         elif text.startswith("/generate"):
             prompt = text[9:].strip()
             if not prompt:
@@ -511,15 +607,26 @@ def webhook():
             else:
                 do_generate(chat_id, prompt)
 
-        # ── /models ──────────────────────────────────────────────────────
         elif text.startswith("/models"):
             ml = "\n\n".join(
                 f"{k}. <b>{v['name']}</b> — {v['desc']}" for k, v in MODELS.items()
             )
             send_message(chat_id, f"🎨 <b>Available Models:</b>\n\n{ml}")
 
-        # ── Batch OR plain-text prompt ───────────────────────────────────
+        elif text.startswith("/model"):
+            send_message(chat_id,
+                f"🤖 <b>Model ಆಯ್ಕೆ ಮಾಡಿ:</b>",
+                inline_markup=models_keyboard()
+            )
+
+        elif text.startswith("/size"):
+            send_message(chat_id,
+                f"📐 <b>Size ಆಯ್ಕೆ ಮಾಡಿ:</b>",
+                inline_markup=sizes_keyboard()
+            )
+
         else:
+            # Batch OR plain-text prompt
             batch = re.match(r'^(\d+)x:\s*(.+)$', text.strip(), re.IGNORECASE)
             if batch:
                 count  = min(int(batch.group(1)), 4)
@@ -532,6 +639,8 @@ def webhook():
                 for i in range(count):
                     send_message(chat_id, f"🎨CC_PIC <b>{i+1}/{count}</b>...")
                     do_generate(chat_id, prompt)
+                    if i < count - 1:
+                        time.sleep(3)
             else:
                 prompt = text.strip()
                 if prompt:
@@ -556,7 +665,7 @@ def setup_webhook():
     return f"❌ Failed: {result}"
 
 @app.route('/status')
-def status():
+def status_route():
     result = telegram_api("getWebhookInfo")
     if result and result.get('ok'):
         info = result.get('result', {})
