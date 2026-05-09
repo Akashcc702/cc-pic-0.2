@@ -7,6 +7,7 @@ import time
 import random
 import re
 import threading
+import json
 from datetime import datetime
 
 app = Flask(__name__)
@@ -293,15 +294,14 @@ def styled_prompt(prompt, chat_id):
 
 
 def do_generate(chat_id, prompt, upscale=False):
-    # Check cooldown (admin bypasses cooldown)
-    if not is_admin(chat_id):
-        on_cd, remaining = check_cooldown(chat_id)
-        if on_cd:
-            send_message(chat_id,
-                f"⏳ <b>Cooldown active!</b> {remaining} remaining\n"
-                f"<i>Please wait before generating next image.</i>"
-            )
-            return
+    # Check cooldown for ALL users
+    on_cd, remaining = check_cooldown(chat_id)
+    if on_cd:
+        send_message(chat_id,
+            f"⏳ <b>Cooldown active!</b> {remaining} remaining\n"
+            f"<i>Please wait before generating next image.</i>"
+        )
+        return
 
     model_key       = user_model_choice.get(chat_id, "1")
     model           = MODELS[model_key]
@@ -343,14 +343,13 @@ def do_generate(chat_id, prompt, upscale=False):
             ]]
         }
 
-        # Send image as photo with reply keyboard + inline buttons
-        # Use reply_markup for inline (caption buttons) - Telegram supports inline on photos
         files  = {"photo": ("image.jpg", image_data, "image/jpeg")}
+        # reply_markup MUST be JSON string when sending multipart/form-data
         result = telegram_api("sendPhoto", {
             "chat_id":      chat_id,
             "caption":      f"🎨CC_PIC\n📝 {prompt[:200]}",
             "parse_mode":   "HTML",
-            "reply_markup": inline_buttons,
+            "reply_markup": json.dumps(inline_buttons),
         }, files=files)
 
         # Fallback to document if photo fails
@@ -360,12 +359,11 @@ def do_generate(chat_id, prompt, upscale=False):
                 "chat_id":      chat_id,
                 "caption":      f"🎨CC_PIC\n📝 {prompt[:200]}",
                 "parse_mode":   "HTML",
-                "reply_markup": inline_buttons,
+                "reply_markup": json.dumps(inline_buttons),
             }, files=files2)
 
-        # Start cooldown AFTER successful generation (non-admin only)
-        if not is_admin(chat_id):
-            start_cooldown(chat_id)
+        # Cooldown for ALL users (admin included)
+        start_cooldown(chat_id)
 
     else:
         send_message(chat_id, error or "❌ Image generate ಆಗಲಿಲ್ಲ.")
@@ -454,7 +452,7 @@ def webhook():
 
             elif cb_data.startswith("vary_"):
                 on_cd, remaining = check_cooldown(chat_id)
-                if not is_admin(chat_id) and on_cd:
+                if on_cd:
                     telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": f"⏳ Cooldown: {remaining} remaining!", "show_alert": True})
                     return jsonify({"status": "ok"})
                 orig_id = int(cb_data[5:])
@@ -467,7 +465,7 @@ def webhook():
 
             elif cb_data.startswith("upscale_"):
                 on_cd, remaining = check_cooldown(chat_id)
-                if not is_admin(chat_id) and on_cd:
+                if on_cd:
                     telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": f"⏳ Cooldown: {remaining} remaining!", "show_alert": True})
                     return jsonify({"status": "ok"})
                 orig_id = int(cb_data[8:])
